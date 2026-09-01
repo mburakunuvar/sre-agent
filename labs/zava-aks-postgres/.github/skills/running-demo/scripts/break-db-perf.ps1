@@ -5,7 +5,7 @@
 # subnet so direct workstation access is impossible).
 #
 # Uses the in-image `bin/run-sql.js` helper — same path the SRE Agent runbook
-# (infra/modules/sre-agent.bicep) tells the agent to use, so this script
+# (sre-config/skills/performance-incidents.md) tells the agent to use, so this script
 # exercises the exact remediation surface the agent has.
 param(
     [string]$ResourceGroup = "",

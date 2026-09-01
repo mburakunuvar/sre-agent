@@ -9,7 +9,7 @@ Azure SRE Agent demo — AKS + PostgreSQL e-commerce app with break/fix scenario
 When a user clones this repo, guide them through setup:
 1. Check prerequisites: `az`, `azd`, `pwsh`, plus Owner/User Access Administrator (or equivalent role-assignment write permission) at subscription scope — install anything missing. (`kubectl` is **not** required on the operator workstation: the AKS cluster is private, operator operations use `az aks command invoke`, and the SRE Agent uses its built-in Kubernetes tools.)
 2. Run `azd up` — pick their default subscription, use `swedencentral` region
-3. After deploy completes, run `scripts/setup-sre-agent.ps1` to upload the knowledge file and verify the Bicep-deployed agent (the agent itself, connectors, skills, response plans, mode, incident binding are all already provisioned by Bicep — this script only handles the data-plane KB upload and a verification readout)
+3. `azd up` runs `scripts/setup-sre-agent.ps1` to apply and verify skills, response plans, knowledge, global instructions, and tool settings. Run it manually only to retry or apply later configuration changes.
 4. Open the storefront in browser to verify it works
 5. Run a break scenario to demonstrate the SRE Agent
 
@@ -36,7 +36,7 @@ These are gotchas for someone editing this repo's IaC or Bicep — they're *not*
 - **Scenario 5 (`break-compound.ps1`) is a bounded correlation proof of concept.** It overlaps Scenario 3 and Scenario 4 by 90 seconds so the sample can compare nearby alerts against dependency, deployment, and database telemetry. The causes are intentionally independent. Run the database-performance fault first because it restarts the API deployment; the bad-deploy revision must remain the latest rollout for the application investigation. Do not present this scenario as a comprehensive correlation benchmark or a guaranteed model outcome.
 - **Skills are split by incident domain.** Keep database, performance, application, general triage, proactive health, and correlation procedures separate. Domain skills may use the read-only correlation skill when needed.
 - **Alert `description` strings in `monitoring.bicep` are agent-readable payload, not cosmetic Bicep strings.** Azure Monitor includes the alert description in the incident context the SRE Agent reads. They MUST stay symptom-only — never re-add "Likely cause: …", "Remediation: …", "(Scenario N)", or any specific resource name (table, index, NetworkPolicy) the agent could pattern-match instead of diagnosing. The descriptions describe what was observed; the runbook + KB explain how to investigate.
-- **Correlation guidance is split between global instructions and an on-demand skill.** `sre-config/custom-instructions.md` identifies when a wider review may be useful; the `incident-correlation` skill in `sre-agent.bicep` contains the read-only procedure. Keep alert descriptions symptom-focused and avoid duplicating correlation instructions across response plans.
+- **Correlation guidance is split between global instructions and an on-demand skill.** `sre-config/custom-instructions.md` identifies when a wider review may be useful; `sre-config/skills/incident-correlation.md` contains the read-only procedure. Keep alert descriptions symptom-focused and avoid duplicating correlation instructions across response plans.
 - **Correlation requires mechanism evidence.** Alert timestamps identify candidate overlap but not causal order. Establish onset from raw telemetry and compare dependency targets, result codes, deployment history, and PostgreSQL metrics before assigning a shared cause.
 - **`Zava-db-cpu-saturation` is disabled by default (`enableDbCpuSaturationAlert=false`).** It supports the Scenario 5 demonstration of checking relevant disabled rules and querying their underlying metrics. Set the parameter to `true` to include the database CPU alert. Metric and scheduled-query rule inventories use different APIs, so the correlation skill checks both.
 - **Use Azure Service Health as a correlation source.** Query subscription events with `Microsoft.ResourceHealth/events` and per-resource state with `availabilityStatuses`. The correlation skill uses the list APIs supported by this sample.
@@ -65,11 +65,11 @@ For agents that support Copilot CLI's project-local skills under `.github/skills
 - `running-demo` — Break/fix scenarios with browser verification (Scenarios 1-4 single-fault, Scenario 5 compound)
 - `managing-sre-agent` — Create/manage SRE Agent skills, response plans, knowledge files
 
-## Data-plane configuration
+## Agent configuration
 
-`scripts/setup-sre-agent.ps1` synchronizes the configuration not represented in
-the Bicep template: knowledge files, Microsoft Learn MCP tool enablement, and
-agent-global custom instructions.
+`scripts/setup-sre-agent.ps1` synchronizes the configuration not deployed by
+the Bicep template: skills, response plans, knowledge files,
+Microsoft Learn MCP tool enablement, and agent-global custom instructions.
 
 The source of truth for custom instructions is
 [`sre-config/custom-instructions.md`](sre-config/custom-instructions.md). Keep

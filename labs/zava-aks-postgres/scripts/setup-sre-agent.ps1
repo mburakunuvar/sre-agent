@@ -1,24 +1,19 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-    Configures the SRE Agent's data-plane-only state after `azd provision`.
+    Configures the Zava SRE Agent after `azd provision`.
 .DESCRIPTION
-    Most agent configuration is now declarative in Bicep
-    (infra/modules/sre-agent.bicep): autonomous mode, AzMonitor incident
-    platform, connectors (app-insights, log-analytics, azure-monitor, learn-docs),
-    custom skills, and incident filters / response plans all flow through
-    Microsoft.App/agents/* ARM resources.
-
-    What stays in this script is the residual data-plane work that ARM does
-    not yet expose:
+    Bicep deploys the agent, supported connectors, identity, networking, mode,
+    and Azure Monitor incident binding. This script applies:
+      - Custom skills
+      - Incident filters / response plans
       - Knowledge file upload (Builder UI > Knowledge sources)
       - Global tool enablement: turn the Microsoft Learn MCP tools ON for every
         agent loop. MCP connector tools ship `defaultMode: disabled` (skill-gated),
         and there is NO ARM/Bicep property for per-tool state (the agent's
         `permissions` stays null) — Microsoft's own `srectl tool config set` CLI
         exists for exactly this (POST /api/v2/agent/tools/configure).
-      - Agent-global custom instructions sync (the cross-alert correlation nudge)
-      - Verification of Bicep-deployed assets
+      - Agent-global custom instructions
 .EXAMPLE
     .\scripts\setup-sre-agent.ps1
 #>
@@ -52,8 +47,8 @@ if (-not $ResourceGroup -or -not $AgentName) {
 $ErrorActionPreference = "Stop"
 
 Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "  SRE Agent Knowledge Sync + Verify" -ForegroundColor Cyan
-Write-Host "  (agent itself is provisioned by Bicep)" -ForegroundColor DarkGray
+Write-Host "  Zava SRE Agent Configuration" -ForegroundColor Cyan
+Write-Host "  (infrastructure + agent configuration)" -ForegroundColor DarkGray
 Write-Host "========================================`n" -ForegroundColor Cyan
 
 if (-not $SubscriptionId) {
@@ -75,15 +70,188 @@ try {
     exit 1
 }
 
-# --- Step 1: Acquire data plane token --------------------------------------
-Write-Host "`nStep 1: Acquiring data plane token..." -ForegroundColor Yellow
-$token = az account get-access-token --resource "https://azuresre.dev" --query accessToken -o tsv
+# --- Step 1: Authenticate --------------------------------------------------
+Write-Host "`nStep 1: Authenticating..." -ForegroundColor Yellow
+$tokenOutput = az account get-access-token --resource "https://azuresre.dev" --query accessToken -o tsv 2>&1
+$tokenText = ($tokenOutput | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $tokenText) {
+    throw "Could not authenticate with the SRE Agent. Sign in to Azure CLI with an account that can configure this agent, then rerun the script."
+}
+$token = $tokenText
 $client = [System.Net.Http.HttpClient]::new()
 $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $token)
 $client.Timeout = [TimeSpan]::FromSeconds(30)
-Write-Host "  Token acquired (audience: azuresre.dev)" -ForegroundColor Green
+Write-Host "  Authentication succeeded" -ForegroundColor Green
 
-# --- Step 2: Sync knowledge files (data-plane only — no ARM equivalent) ----
+# --- Helpers ---------------------------------------------------------------
+function Invoke-DataPlanePut {
+    param(
+        [string]$Path,
+        [object]$Body,
+        [string]$Label,
+        [int]$MaxAttempts = 1,
+        [int]$RetryDelaySeconds = 15
+    )
+
+    $json = $Body | ConvertTo-Json -Depth 20 -Compress
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $content = [System.Net.Http.StringContent]::new($json, [System.Text.Encoding]::UTF8, "application/json")
+        try {
+            $response = $client.PutAsync("$agentEndpoint$Path", $content).Result
+            $responseBody = $response.Content.ReadAsStringAsync().Result
+            if ($response.IsSuccessStatusCode) {
+                Write-Host "  [ok] $Label" -ForegroundColor Green
+                return $true
+            }
+
+            if ($attempt -eq $MaxAttempts) {
+                Write-Host "  [failed] $Label returned HTTP $([int]$response.StatusCode): $responseBody" -ForegroundColor Red
+                return $false
+            }
+        } catch {
+            if ($attempt -eq $MaxAttempts) {
+                Write-Host "  [failed] ${Label}: $($_.Exception.Message)" -ForegroundColor Red
+                return $false
+            }
+        } finally {
+            $content.Dispose()
+        }
+
+        Write-Host "  [retry] $Label attempt $attempt/$MaxAttempts; waiting ${RetryDelaySeconds}s for platform initialization" -ForegroundColor Yellow
+        Start-Sleep -Seconds $RetryDelaySeconds
+    }
+}
+
+function Get-DataPlaneCollection {
+    param([string]$Path)
+
+    $response = $client.GetAsync("$agentEndpoint$Path").Result
+    $responseBody = $response.Content.ReadAsStringAsync().Result
+    if (-not $response.IsSuccessStatusCode) {
+        throw "GET $Path returned HTTP $([int]$response.StatusCode): $responseBody"
+    }
+
+    $parsed = $responseBody | ConvertFrom-Json
+    if ($parsed -is [array]) { return @($parsed) }
+    if ($parsed.PSObject.Properties['value']) { return @($parsed.value) }
+    return @()
+}
+
+function Compare-ExpectedProperties {
+    param(
+        [object]$Expected,
+        [object]$Actual,
+        [string]$Path,
+        [System.Collections.Generic.List[string]]$Differences
+    )
+
+    $keys = if ($Expected -is [System.Collections.IDictionary]) {
+        @($Expected.Keys)
+    } else {
+        @($Expected.PSObject.Properties.Name)
+    }
+
+    foreach ($key in $keys) {
+        if ($Expected -is [System.Collections.IDictionary]) {
+            $expectedValue = $Expected[$key]
+        } else {
+            $expectedValue = $Expected.PSObject.Properties[$key].Value
+        }
+        $actualProperty = $Actual.PSObject.Properties[$key]
+        if (-not $actualProperty) {
+            $Differences.Add("$Path.$key is missing")
+            continue
+        }
+
+        $expectedJson = ConvertTo-Json -InputObject $expectedValue -Depth 20 -Compress
+        $actualJson = ConvertTo-Json -InputObject $actualProperty.Value -Depth 20 -Compress
+        if ($expectedJson -cne $actualJson) {
+            $Differences.Add("$Path.$key differs")
+        }
+    }
+}
+
+# --- Step 2: Sync skills ---------------------------------------------------
+Write-Host "`nStep 2: Syncing custom skills..." -ForegroundColor Yellow
+$configPath = Join-Path $PSScriptRoot "..\sre-config\agent-config.json"
+$configRoot = Split-Path $configPath -Parent
+if (-not (Test-Path $configPath)) {
+    throw "Missing agent configuration: $configPath"
+}
+
+$agentConfig = Get-Content -Raw $configPath | ConvertFrom-Json
+$sharedContextPath = Join-Path $configRoot "skills\shared-context.md"
+if (-not (Test-Path $sharedContextPath)) {
+    throw "Missing shared skill context: $sharedContextPath"
+}
+$sharedContext = ([System.IO.File]::ReadAllText($sharedContextPath)).Replace('@@RG@@', $ResourceGroup).Trim()
+
+$skillFailures = 0
+$expectedSkillProperties = @{}
+foreach ($skill in @($agentConfig.skills)) {
+    $skillPath = Join-Path $configRoot $skill.skillContentFile
+    if (-not (Test-Path $skillPath)) {
+        Write-Host "  [failed] $($skill.name): missing $skillPath" -ForegroundColor Red
+        $skillFailures++
+        continue
+    }
+
+    $skillContent = ([System.IO.File]::ReadAllText($skillPath)).
+        Replace('@@SHARED@@', $sharedContext).
+        Replace('@@RG@@', $ResourceGroup).
+        Trim()
+    $expectedProperties = [ordered]@{
+        description = $skill.description
+        tools = @($skill.tools)
+        skillContent = $skillContent
+        additionalFiles = @()
+        sourcePluginInstallation = $null
+    }
+    $expectedSkillProperties[$skill.name] = $expectedProperties
+    $body = @{
+        name = $skill.name
+        type = "Skill"
+        tags = @()
+        properties = [ordered]@{
+            name = $skill.name
+            description = $expectedProperties.description
+            tools = $expectedProperties.tools
+            skillContent = $expectedProperties.skillContent
+            additionalFiles = $expectedProperties.additionalFiles
+            sourcePluginInstallation = $expectedProperties.sourcePluginInstallation
+        }
+    }
+    $encodedName = [uri]::EscapeDataString($skill.name)
+    if (-not (Invoke-DataPlanePut -Path "/api/v2/extendedAgent/skills/$encodedName" -Body $body -Label "skill/$($skill.name)")) {
+        $skillFailures++
+    }
+}
+if ($skillFailures -gt 0) {
+    throw "$skillFailures custom skill(s) failed to synchronize."
+}
+
+# --- Step 3: Sync response plans -------------------------------------------
+Write-Host "`nStep 3: Syncing incident response plans..." -ForegroundColor Yellow
+$filterFailures = 0
+$expectedFilterProperties = @{}
+foreach ($filter in @($agentConfig.incidentFilters)) {
+    $expectedFilterProperties[$filter.name] = $filter.properties
+    $body = @{
+        name = $filter.name
+        type = "IncidentFilter"
+        tags = @()
+        properties = $filter.properties
+    }
+    $encodedName = [uri]::EscapeDataString($filter.name)
+    if (-not (Invoke-DataPlanePut -Path "/api/v2/extendedAgent/incidentFilters/$encodedName" -Body $body -Label "response-plan/$($filter.name)" -MaxAttempts 4)) {
+        $filterFailures++
+    }
+}
+if ($filterFailures -gt 0) {
+    throw "$filterFailures incident response plan(s) failed to synchronize."
+}
+
+# --- Step 4: Sync knowledge files (data-plane only — no ARM equivalent) ----
 # Knowledge files are stored as data-plane connectors of type KnowledgeFile.
 # PUT to /connectors/{filename} creates or replaces the named file.
 #
@@ -93,7 +261,7 @@ Write-Host "  Token acquired (audience: azuresre.dev)" -ForegroundColor Green
 # skip. Otherwise we PUT the file (which replaces any existing copy with the
 # same name) and update the cache. The agent KB API does not surface a content
 # hash on its file list, so a local sidecar cache is the simplest robust signal.
-Write-Host "`nStep 2: Syncing knowledge files..." -ForegroundColor Yellow
+Write-Host "`nStep 4: Syncing knowledge files..." -ForegroundColor Yellow
 $kbDir = Resolve-Path "$PSScriptRoot\..\sre-config\knowledge-base"
 $kbLocalFiles = @(Get-ChildItem -Path $kbDir -Filter "*.md" -File)
 $hashCachePath = Join-Path $kbDir ".upload-hashes.json"
@@ -180,8 +348,12 @@ try {
 }
 
 Write-Host ("  Summary: {0} uploaded, {1} replaced, {2} skipped, {3} failed (of {4} local files)" -f $uploaded, $replaced, $skipped, $failed, $kbLocalFiles.Count) -ForegroundColor Yellow
+if ($failed -gt 0) {
+    $client.Dispose()
+    throw "$failed knowledge file upload(s) failed. The remote content may be stale."
+}
 
-# --- Step 2b: Enable Microsoft Learn MCP tools globally (data-plane only) ----
+# --- Step 5: Enable Microsoft Learn MCP tools globally ---------------------
 # MCP connector tools ship `defaultMode: disabled` — they are skill-gated, i.e.
 # only surface when an incident skill that lists them is active. To make the
 # Microsoft Learn docs tools part of the GLOBAL tool roster (available to every
@@ -194,7 +366,7 @@ Write-Host ("  Summary: {0} uploaded, {1} replaced, {2} skipped, {3} failed (of 
 # The tools only appear in the catalog AFTER the learn-docs connector
 # completes its first tools/list handshake (which needs the GitHub-raw firewall
 # allow in vnet.bicep + a warm connection), so we poll for them before enabling.
-Write-Host "`nStep 2b: Enabling Microsoft Learn MCP tools globally..." -ForegroundColor Yellow
+Write-Host "`nStep 5: Enabling Microsoft Learn MCP tools globally..." -ForegroundColor Yellow
 $learnToolSets = @(
     [pscustomobject]@{
         Connector = 'learn-docs'
@@ -260,7 +432,7 @@ if ($present.Count -gt 0) {
     }
 }
 
-# --- Step 2c: Sync custom instructions (data-plane only) --------------------
+# --- Step 6: Sync custom instructions (data-plane only) ---------------------
 # Custom instructions are the agent-scoped, ALWAYS-ON prompt appended to EVERY
 # thread — chat, incident, scheduled task — regardless of which response plan or
 # skill matched. This is the surface the portal's "Custom instructions" box writes.
@@ -270,7 +442,7 @@ if ($present.Count -gt 0) {
 #   body: { "instructions": "<text>" }
 #
 # The global instructions cover correlation and bounded parallel investigation.
-Write-Host "`nStep 2c: Syncing custom instructions..." -ForegroundColor Yellow
+Write-Host "`nStep 6: Syncing custom instructions..." -ForegroundColor Yellow
 $ciPath = Join-Path $PSScriptRoot "..\sre-config\custom-instructions.md"
 $ciText = $null
 $ciCurrent = $null
@@ -310,8 +482,8 @@ if (-not (Test-Path $ciPath)) {
     }
 }
 
-# --- Step 3: Verify Bicep-deployed assets ----------------------------------
-Write-Host "`nStep 3: Verifying Bicep-deployed configuration..." -ForegroundColor Yellow
+# --- Step 7: Verify the combined configuration -----------------------------
+Write-Host "`nStep 7: Verifying ARM + data-plane configuration..." -ForegroundColor Yellow
 $allGood = $true
 $armToken = (az account get-access-token --resource "https://management.azure.com/" --query accessToken -o tsv 2>$null).Trim()
 if (-not $armToken) {
@@ -351,17 +523,39 @@ else { $learnConnectorName = $learnConnector.name }
 if (-not $missingConnectors) { Write-Host "  [OK] Connectors: $($connectors.Count) (app-insights, log-analytics, azure-monitor, $($learnConnector.name))" -ForegroundColor Green }
 else { Write-Host "  [MISSING] Connectors: $($missingConnectors -join ', ') — re-run azd provision" -ForegroundColor Red; $allGood = $false }
 
-$skills = @(Get-AgentChildren -Kind "skills")
-$expectedSkills = @("database-incidents","performance-incidents","application-incidents","general-triage","proactive-health-check","incident-correlation")
-$missingSkills = $expectedSkills | Where-Object { $_ -notin $skills.name }
-if (-not $missingSkills) { Write-Host "  [OK] Custom skills: $($skills.Count)" -ForegroundColor Green }
-else { Write-Host "  [MISSING] Skills: $($missingSkills -join ', ') — re-run azd provision" -ForegroundColor Red; $allGood = $false }
+$skills = @(Get-DataPlaneCollection -Path "/api/v2/extendedAgent/skills")
+$skillDifferences = [System.Collections.Generic.List[string]]::new()
+foreach ($skillName in @($agentConfig.skills.name)) {
+    $deployedSkill = $skills | Where-Object { $_.name -eq $skillName } | Select-Object -First 1
+    if (-not $deployedSkill) {
+        $skillDifferences.Add("$skillName is missing")
+        continue
+    }
+    Compare-ExpectedProperties -Expected ($expectedSkillProperties[$skillName]) -Actual $deployedSkill.properties -Path $skillName -Differences $skillDifferences
+}
+if ($skillDifferences.Count -eq 0) {
+    Write-Host "  [OK] Custom skills: $($expectedSkillProperties.Count) match source" -ForegroundColor Green
+} else {
+    Write-Host "  [MISMATCH] Skills: $($skillDifferences -join '; ')" -ForegroundColor Red
+    $allGood = $false
+}
 
-$filters = @(Get-AgentChildren -Kind "incidentFilters")
-$expectedFilters = @("zava-database","zava-performance","zava-application","zava-unknown")
-$missingFilters = $expectedFilters | Where-Object { $_ -notin $filters.name }
-if (-not $missingFilters) { Write-Host "  [OK] Response plans: $($filters.Count)" -ForegroundColor Green }
-else { Write-Host "  [MISSING] Response plans: $($missingFilters -join ', ') — re-run azd provision" -ForegroundColor Red; $allGood = $false }
+$filters = @(Get-DataPlaneCollection -Path "/api/v2/extendedAgent/incidentFilters")
+$filterDifferences = [System.Collections.Generic.List[string]]::new()
+foreach ($filterName in @($agentConfig.incidentFilters.name)) {
+    $deployedFilter = $filters | Where-Object { $_.name -eq $filterName } | Select-Object -First 1
+    if (-not $deployedFilter) {
+        $filterDifferences.Add("$filterName is missing")
+        continue
+    }
+    Compare-ExpectedProperties -Expected ($expectedFilterProperties[$filterName]) -Actual $deployedFilter.properties -Path $filterName -Differences $filterDifferences
+}
+if ($filterDifferences.Count -eq 0) {
+    Write-Host "  [OK] Response plans: $($expectedFilterProperties.Count) match source" -ForegroundColor Green
+} else {
+    Write-Host "  [MISMATCH] Response plans: $($filterDifferences -join '; ')" -ForegroundColor Red
+    $allGood = $false
+}
 
 $kbResp = $client.GetAsync("$agentEndpoint/api/v2/extendedAgent/connectors").Result
 $knowledgeFiles = @()
@@ -400,7 +594,7 @@ if (-not $ciText) {
         Write-Host "  [OK] Custom instructions match local source ($($ciText.Length) chars)" -ForegroundColor Green
         $customInstructionsVerified = $true
     } else {
-        Write-Host "  [MISSING] Custom instructions do not match local source — re-run Step 2c" -ForegroundColor Red
+        Write-Host "  [MISSING] Custom instructions do not match local source - re-run Step 6" -ForegroundColor Red
         $allGood = $false
     }
 }
@@ -428,9 +622,12 @@ if ($learnEnabled.Count -eq $learnTools.Count) {
     Write-Host "  [WARN] Learn MCP tools enabled globally: $($learnEnabled.Count)/$($learnTools.Count) (MCP connection may still be warming up)" -ForegroundColor Yellow
 }
 
-if ($allGood) { Write-Host "  All required Bicep + data-plane assets verified." -ForegroundColor Green }
-else { Write-Host "  Required assets are missing — see above." -ForegroundColor Red }
+if (-not $allGood) {
+    $client.Dispose()
+    throw "Required SRE Agent assets are missing or misconfigured. Review the verification failures above."
+}
 
+Write-Host "  All required Bicep + data-plane assets verified." -ForegroundColor Green
 $client.Dispose()
 
 # --- Summary ---------------------------------------------------------------
@@ -438,13 +635,13 @@ Write-Host "`n========================================" -ForegroundColor Cyan
 Write-Host "  Done" -ForegroundColor Cyan
 Write-Host "========================================`n" -ForegroundColor Cyan
 
-Write-Host "  DEPLOYED BY BICEP (verified above, not done by this script):" -ForegroundColor DarkGray
+Write-Host "  DEPLOYED BY BICEP:" -ForegroundColor DarkGray
 Write-Host "  [x] Agent: autonomous mode + High access"
 Write-Host "  [x] Incident platform: Azure Monitor"
 Write-Host "  [x] Connectors: app-insights, log-analytics, azure-monitor, $learnConnectorName"
+Write-Host "`n  APPLIED BY SETUP SCRIPT:" -ForegroundColor Cyan
 Write-Host "  [x] Custom skills: database-incidents, performance-incidents, application-incidents, general-triage, proactive-health-check, incident-correlation"
 Write-Host "  [x] Response plans (incident filters): zava-database, zava-performance, zava-application, zava-unknown"
-Write-Host "`n  DONE BY THIS SCRIPT (data plane — no ARM API yet):" -ForegroundColor Cyan
 Write-Host ("  [x] Knowledge files synced: {0} local file(s) ({1} uploaded, {2} replaced, {3} skipped, {4} failed)" -f $kbLocalFiles.Count, $uploaded, $replaced, $skipped, $failed)
 if ($learnEnabled.Count -eq $learnTools.Count) {
     Write-Host ("  [x] Microsoft Learn MCP tools enabled globally: {0}/{1} (docs_search, code_sample_search, docs_fetch)" -f $learnEnabled.Count, $learnTools.Count)
@@ -464,5 +661,3 @@ Write-Host "    .\.github\skills\running-demo\scripts\break-db-perf.ps1  # Drop 
 Write-Host "    .\.github\skills\running-demo\scripts\break-bad-deploy.ps1 # Ship a bad rollout"
 Write-Host "    .\.github\skills\running-demo\scripts\break-compound.ps1  # Two independent faults"
 Write-Host "  Watch the agent: https://sre.azure.com/agents$agentArmId`n"
-
-if (-not $allGood) { exit 1 }
