@@ -29,7 +29,7 @@ so the template grants its runtime identity the built-in Reader role there. The
 | **App** | Zava Athletic e-commerce storefront (Node.js/Express on AKS) |
 | **Database** | PostgreSQL 16 Flexible Server (Entra-only auth, zero passwords) |
 | **Monitoring** | App Insights, Log Analytics, OpenTelemetry application metrics, PostgreSQL platform metrics, and three dispatching Azure Monitor alerts: database availability, query performance, and application 5xx failures |
-| **SRE Agent** | Preview-channel agent with declarative connectors, skills, response plans, Azure Monitor incident binding, and global custom instructions. The source repository is deliberately not connected in this lab. |
+| **SRE Agent** | Preview-channel agent with ARM-deployed core infrastructure and connectors, plus script-applied skills, response plans, knowledge, and global instructions. The source repository is deliberately not connected in this lab. |
 | **Telemetry access** | App Insights, Log Analytics, and Azure Monitor exposed via **connectors** |
 | **Demo Scenarios** | 5 break/fix scenarios with scripts |
 
@@ -155,15 +155,15 @@ rights remain limited to the demo resource group.
 
 ## SRE Agent Management
 
-Agent configuration is fully declarative in **`infra/modules/sre-agent.bicep`** —
-connectors, custom skills, response plans / incident filters, autonomous mode, and Azure
-Monitor incident binding all flow through `Microsoft.App/agents/*` ARM resources. To change
-them, edit the Bicep and run `azd provision`.
+Core infrastructure remains declarative in **`infra/modules/sre-agent.bicep`**:
+the agent, supported connectors, autonomous mode, identity, networking, and
+Azure Monitor incident binding.
 
-Residual data-plane state is handled by `scripts/setup-sre-agent.ps1`: knowledge-file
-upload, the singleton agent-global custom instructions, and Microsoft Learn MCP tool
-enablement. The script also verifies the Bicep-deployed assets are live. Drop new
-`*.md` files into `sre-config/knowledge-base/` and re-run the script to sync.
+Custom skills and response plans are not deployed by Bicep.
+`scripts/setup-sre-agent.ps1` applies them from
+`sre-config/agent-config.json` and `sre-config/skills/`. The same script syncs
+knowledge files, global custom instructions, and Microsoft Learn tools, then
+verifies the complete configuration.
 
 ## How the Agent Operates Against a Private Backend
 
@@ -353,8 +353,8 @@ zava-aks-postgres/
 │   ├── _aks-helpers.ps1          #   Invoke-AksCommand wrapper (REST fallback)
 │   ├── check-environment.ps1     #   azd preprovision hook
 │   ├── post-provision.ps1        #   azd postprovision hook
-│   └── setup-sre-agent.ps1       #   Knowledge file upload + verification
-└── sre-config/                   # Knowledge base files (skills, response plans, and connectors are declared in infra/modules/sre-agent.bicep)
+│   └── setup-sre-agent.ps1       #   Agent configuration + verification
+└── sre-config/                   # Agent config, runtime skills, custom instructions, and knowledge
 ```
 
 ## License

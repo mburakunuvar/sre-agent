@@ -54,17 +54,21 @@ $ip = ($r.logs -replace '[^\d\.]','').Trim()
 > `RunKubectlWriteCommand` tools. See `docs/aks-access-and-auth.md` for other
 > operator and automation access options.
 
-## Phase 3: Sync knowledge + verify SRE Agent
+## Phase 3: Configure + verify SRE Agent
 
-The agent itself — connectors, custom skills, response plans, autonomous mode,
-Azure Monitor binding — is already provisioned by Bicep during `azd up`. This
-script uploads knowledge files, syncs the agent-global custom instructions,
-enables the Microsoft Learn MCP tools, and verifies the complete configuration.
+Bicep provisions the agent, supported connectors, autonomous mode, and Azure
+Monitor binding. The setup script applies custom skills and response plans
+from the repository, uploads knowledge files, syncs global instructions,
+enables the Microsoft Learn tools, and verifies the result.
+
+`azd up` runs `setup-sre-agent.ps1` through the post-provision hook. Run it
+manually only to retry or apply later configuration changes:
 
 1. Get azd values: `$env:SRE_AGENT_ENDPOINT = azd env get-value SRE_AGENT_ENDPOINT` (and RESOURCE_GROUP, SRE_AGENT_NAME)
 2. Run: `.\scripts\setup-sre-agent.ps1` (auto-detects ResourceGroup and AgentName from `azd env`)
-3. If anything in Step 3's verification output reports `[MISSING]`, re-run
-   `azd provision` to converge the Bicep state.
+3. If Step 7 reports a missing skill or response plan, re-run
+   `setup-sre-agent.ps1`. If a connector or core agent setting is missing,
+   re-run `azd provision`.
 
 ## Optional: confirm the agent is reachable
 

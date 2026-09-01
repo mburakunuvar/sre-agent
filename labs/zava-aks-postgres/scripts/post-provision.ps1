@@ -357,14 +357,14 @@ Write-Host "  API Health:   http://$ingressIP/api/health" -ForegroundColor White
 Write-Host "  API Products: http://$ingressIP/api/products" -ForegroundColor White
 Write-Host "  Diagnostics:  http://$ingressIP/api/diagnostics" -ForegroundColor White
 Write-Host ""
-Write-Host "  SRE Agent (already provisioned by Bicep above):" -ForegroundColor Yellow
-Write-Host "  - Agent + connectors + custom skills + response plans = Bicep" -ForegroundColor DarkGray
-Write-Host "  - Knowledge file upload + verification = setup-sre-agent.ps1 (next)" -ForegroundColor DarkGray
+Write-Host "  SRE Agent:" -ForegroundColor Yellow
+Write-Host "  - Agent + supported connectors + mode + incident binding = Bicep" -ForegroundColor DarkGray
+Write-Host "  - Skills + response plans + knowledge + verification = setup-sre-agent.ps1 (next)" -ForegroundColor DarkGray
 Write-Host "========================================" -ForegroundColor Cyan
 
-# === Knowledge file sync + verification ===
+# === Agent configuration + verification ===
 Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "  Syncing knowledge + verifying agent" -ForegroundColor Cyan
+Write-Host "  Configuring + verifying agent" -ForegroundColor Cyan
 Write-Host "========================================`n" -ForegroundColor Cyan
 
 $agentName = try { Get-AzdValue "SRE_AGENT_NAME" } catch { "" }
